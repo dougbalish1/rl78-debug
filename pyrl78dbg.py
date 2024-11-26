@@ -1,5 +1,11 @@
 import serial
-import time, struct, binascii, code, os
+import time, struct, binascii, code
+import gpiod
+
+chip = gpiod.Chip('gpiochip4')
+reset_line = chip.get_line(17)
+reset_line.request(consumer='pyrl78dbg', type=gpiod.LINE_REQ_DIR_OUT, default_vals=[1])
+reset_line.set_value(1)
 
 def delay(amount):
     now = start = time.perf_counter()
@@ -14,6 +20,7 @@ def read_all(port, size):
     while len(data) < size:
         data += port.read(size - len(data))
     assert len(data) == size
+    print('recv %s' % (binascii.hexlify(data)))
     return data
 
 def size8(size):
@@ -82,7 +89,7 @@ class ProtoA:
         LEN = size8(struct.unpack('B', len_b)[0])
         recv_len = LEN + 2
         data = s.read_all(recv_len)
-        #print('recv %s' % (binascii.hexlify(data)))
+        print('recv %s' % (binascii.hexlify(data)))
         if s._checksum(len_b + data[:LEN]) != data[LEN]:
             print('bad checksum')
         if data[LEN+1] != s.ETX:
@@ -95,7 +102,7 @@ class ProtoA:
         LEN = size8(len(data))
         SUM = s._checksum(struct.pack('B', LEN) + data)
         cmd = struct.pack('BB%dBBB' % (len(data)), header, LEN, *data, SUM, trailer)
-        #print('send %s' % (binascii.hexlify(cmd)))
+        print('send %s' % (binascii.hexlify(cmd)))
         s.port.write(cmd)
         # discard the loopback bytes
         s.read_all(len(cmd))
@@ -304,8 +311,9 @@ class RL78:
         s.mode = None
 
     def enter_rom(s):
-        # Step 1: Set DTR high
-        s.port.dtr = True
+        global reset_line
+        # Step 1: Set reset low
+        reset_line.set_value(0)
         time.sleep(0.1)
         print("DTR set to high.")
         s.port.baudrate = 300
@@ -313,8 +321,8 @@ class RL78:
         s.port.write(b'\x00')  # Transmit a byte with value 0x00
         # Step 3: Wait briefly to ensure TX is in the transmit phase
         time.sleep(0.01)  # Small delay to ensure TX is transmitting
-        # Step 4: Set DTR low while TX is still transmitting
-        s.port.dtr = False
+        # Step 4: Set reset high
+        reset_line.set_value(1)
         print("DTR set to low.")
 
     def reset(s, mode):
@@ -348,6 +356,8 @@ if __name__ == '__main__':
     if not rl78.reset(RL78.MODE_OCD):
         print('failed to init a')
         exit()
+    print("RL78 initialized.")
+    rl78.ocd.unlock(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
     print('sig', binascii.hexlify(rl78.a.silicon_sig()))
     print('sec', binascii.hexlify(rl78.a.security_get()))
     code.InteractiveConsole(locals = locals()).interact('Entering shell...')
