@@ -1,6 +1,7 @@
 import serial
 import time, struct, binascii, code
 import gpiod
+import time
 
 chip = gpiod.Chip('gpiochip4')
 reset_line = chip.get_line(17)
@@ -20,7 +21,6 @@ def read_all(port, size):
     while len(data) < size:
         data += port.read(size - len(data))
     assert len(data) == size
-    print('recv %s' % (binascii.hexlify(data)))
     return data
 
 def size8(size):
@@ -119,7 +119,7 @@ class ProtoA:
 
     # Called with 0, 21 for 115200 baudrate
     def set_baudrate(s, baudrate, voltage):
-        print('set baudrate %d, voltage %d' % (baudrate, voltage))
+        # print('set baudrate %d, voltage %d' % (baudrate, voltage))
         return s.send_frame(struct.pack('BBB', s.COM_BAUDRATE_SET, baudrate, voltage))
 
     def silicon_sig(s):
@@ -188,14 +188,20 @@ class ProtoA:
         return s.send_frame(struct.pack('B', s.COM_ERASE) + pack24(addr))
 
     def program(s, addr, data):
+        if addr % 0x400 or len(data) % 0x400:
+            print('bad addr or size')
+            return False
         SA = pack24(addr)
         EA = pack24(addr + len(data) - 1)
         r = s.send_frame(struct.pack('B', s.COM_PROG) + SA + EA)
         if r[0] != s.ST_ACK: return False
         for i in range(0, len(data), 0x100):
+            delay(0.001)
             last_data = len(data) - i <= 0x100
             r = s.send_frame(data[i:i+0x100], False, last_data)
+
         if r[0] != s.ST_ACK or r[1] != s.ST_ACK:
+            print('program failed: %s' % (binascii.hexlify(r)))
             return False
         # iverify status
         return s.recv_frame()
@@ -255,7 +261,9 @@ class ProtoOCD:
         s.wait_ack()
     def ping(s):
         s.send_cmd(struct.pack('B', s.PING))
-        return s.read_all(len(s.PONG)) == s.PONG
+        ret = s.read_all(len(s.PONG))
+        print('ping: ', ret)
+        return ret == s.PONG
         #return s.read_all(len(ping_result)) == ping_result
     def unlock(s, ocd_id, corrupt_sum = False):
         s.send_cmd(struct.pack('B', s.UNLOCK))
@@ -305,7 +313,7 @@ class RL78:
     BAUDRATE_INIT = 115200
     BAUDRATE_FAST = 1000000
     def __init__(s, uart_port):
-        s.port = serial.Serial(uart_port, baudrate=s.BAUDRATE_INIT, timeout=0, stopbits=2)
+        s.port = serial.Serial(uart_port, baudrate=s.BAUDRATE_INIT, timeout=0, stopbits=1)
         s.a = ProtoA(s.port)
         s.ocd = ProtoOCD(s.port)
         s.mode = None
@@ -348,7 +356,10 @@ class RL78:
             if r[0] != ProtoA.ST_ACK: return False
         else:
             s.ocd.wait_ack()
-            if not s.ocd.ping(): return False
+            ret = s.ocd.ping()
+            if not ret:
+                print('ocd ping failed')
+                return False
         return True
 
 if __name__ == '__main__':
@@ -358,6 +369,33 @@ if __name__ == '__main__':
         exit()
     print("RL78 initialized.")
     rl78.ocd.unlock(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-    print('sig', binascii.hexlify(rl78.a.silicon_sig()))
-    print('sec', binascii.hexlify(rl78.a.security_get()))
-    code.InteractiveConsole(locals = locals()).interact('Entering shell...')
+    
+    # i = 0
+    # while True:
+    #     print(i)
+    #     i+=1
+    #     if not rl78.ocd.ping(): break
+
+    #rl78.ocd.unlock(b'\xFF\x00\x00\x00\xFF\x00\x00\x00\xFF\x00')
+    # rl78.ocd.unlock(b'\xFF\x00\x00\x00\xFF\x00\x00\x00\xFF\x00')
+    # rl78.ocd.unlock(b'\xFF\x00\x00\x00\xFF\x00\x00\x00\xFF\x00')
+    # print('sig', binascii.hexlify(rl78.a.silicon_sig()))
+    # print('sec', binascii.hexlify(rl78.a.security_get()))
+    # # code.InteractiveConsole(locals = locals()).interact('Entering shell...')
+
+    data = rl78.ocd.read(0x00, 0x100)
+    # Print 0xC0 to 0xC3
+    print(data[0xC0:0xC4])
+    print(data)
+    # # Get initial checksum in hex 
+    # print('checksum', hex(rl78.a.checksum(0x0000, 0x400)))
+
+    # # Create 1kb block of FF
+    # data = b'\xff' * 0x400
+
+    # # Write data to address 0x0000
+    # rl78.a.program(0x0000, data)
+
+    # # Get checksum after writing data
+    # print('checksum', hex(rl78.a.checksum(0x0000, 0x400)))
+    

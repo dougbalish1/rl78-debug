@@ -1,6 +1,12 @@
-from pyftdi.gpio import GpioController
 import serial
 import time, struct, binascii, code, os
+import argparse
+import gpiod
+
+chip = gpiod.Chip('gpiochip4')
+reset_line = chip.get_line(17)
+reset_line.request(consumer='pyrl78dbg', type=gpiod.LINE_REQ_DIR_OUT, default_vals=[1])
+reset_line.set_value(1)
 
 def delay(amount):
     now = start = time.perf_counter()
@@ -8,36 +14,6 @@ def delay(amount):
         now = time.perf_counter()
         if now - start >= amount:
             return
-
-# for C232HM-DDHSL-0 cable
-WIRE_ORANGE = 1 << 0
-WIRE_YELLOW = 1 << 1
-WIRE_GREEN = 1 << 2
-WIRE_BROWN = 1 << 3
-WIRE_GRAY = 1 << 4
-WIRE_PURPLE = 1 << 5
-WIRE_WHITE = 1 << 6
-WIRE_BLUE = 1 << 7
-
-class Reset:
-    def __init__(s, url):
-        # init gpio mode with gray (conncted to RESET) and green (TOOL0) as outputs
-        s.gpio = GpioController()
-        s.gpio.open_from_url(url, direction = WIRE_GRAY | WIRE_GREEN)
-
-    def enter_rom(s):
-        s.gpio.set_direction(WIRE_GRAY | WIRE_GREEN)
-        # RESET=0, TOOL0=0
-        s.gpio.write_port(0)
-        delay(.04)
-        # RESET=1, TOOL0=0
-        s.gpio.write_port(WIRE_GRAY)
-        delay(.001)
-        # RESET=1, TOOL0=1
-        s.gpio.write_port(WIRE_GRAY | WIRE_GREEN)
-        delay(.01)
-        # stop driving TOOL0 (with this ftdi device - another one takes over)
-        s.gpio.set_direction(WIRE_GRAY)
 
 def read_all(port, size):
     data = b''
@@ -309,7 +285,7 @@ class ProtoOCD:
     def write(s, addr, data):
         size = size8(len(data))
         if size is None: return None
-        s.send_cmd(struct.pack('<BHB%dB' (len(data)), s.WRITE, addr, size, *data))
+        s.send_cmd(struct.pack('<BHB%dB' % (len(data)), s.WRITE, addr, size, *data))
         return s.read_all(1)[0] == s.WRITE
     def call_f07e0(s):
         s.send_cmd(struct.pack('B', s.EXEC))
@@ -325,16 +301,37 @@ class RL78:
     MODE_OCD = b'\xc5'
     BAUDRATE_INIT = 115200
     BAUDRATE_FAST = 1000000
-    def __init__(s, gpio_url, uart_port):
-        s.reset_ctl = Reset(gpio_url)
+
+    SHELLCODE = [
+        0x41, 0x00, 0x34, 0x00, 0x00, 0x00, 0x11, 0x89, 0xFC, 0xA1, 0xFF, 0x0E, 0xA5, 0x15, 0x44,
+        0x00, 0x00, 0xDF, 0xF3, 0xEF, 0x04, 0x55, 0x00, 0x00, 0x00, 0x8E, 0xFD, 0x81, 0x5C, 0x0F,
+        0x9E, 0xFD, 0x71, 0x00, 0x90, 0x00, 0xEF, 0xE0
+    ]
+
+    def __init__(s, uart_port):
         s.port = serial.Serial(uart_port, baudrate=s.BAUDRATE_INIT, timeout=0, stopbits=1)
         s.a = ProtoA(s.port)
         s.ocd = ProtoOCD(s.port)
         s.mode = None
+
+    def enter_rom(s):
+        global reset_line
+        # Step 1: Set reset low
+        reset_line.set_value(0)
+        time.sleep(0.1)
+        print("DTR set to high.")
+        s.port.baudrate = 300
+        # Step 2: Send a byte to bring TX low temporarily
+        s.port.write(b'\x00')  # Transmit a byte with value 0x00
+        # Step 3: Wait briefly to ensure TX is in the transmit phase
+        time.sleep(0.01)  # Small delay to ensure TX is transmitting
+        reset_line.set_value(1)
+        print("DTR set to low.")
+
     def reset(s, mode):
         s.mode = mode
+        s.enter_rom()
         s.port.baudrate = s.BAUDRATE_INIT
-        s.reset_ctl.enter_rom()
         s.port.write(s.mode)
         # we'll see the reset as a null byte. discard it and the init byte
         read_all(s.port, 2)
@@ -356,12 +353,98 @@ class RL78:
             s.ocd.wait_ack()
             if not s.ocd.ping(): return False
         return True
+    
+    def format_frame(s,frame):
+        return " ".join(f"{byte:02X}" for byte in frame)
+    
+    def print_dict(s,data):
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, bytes):
+                    print(f"{key}: {s.format_frame(value)}")
+                else:
+                    print(f"{key}: {repr(value)}")
+        else:
+            print("Provided input is not a dictionary.")
+    
+    def parse_signature(self, byte_array):
+        expected_size = 3 + 10 + 3 + 3 + 3
+        if len(byte_array) != expected_size:
+            raise ValueError(f"Expected byte array of length {expected_size}, but got {len(byte_array)}")
+        DEC = f"0x{int.from_bytes(byte_array[0:3], "little"):0{2}X}"
+        DEV = byte_array[3:13].decode('ascii')
+        CEN = f"00000H - {int.from_bytes(byte_array[13:16], "little"):0{2}X}H"
+        DEN = f"F1000H - {int.from_bytes(byte_array[16:19], "little"):0{2}X}H"
+        VER = f"V{byte_array[19]}.{byte_array[20]}.{byte_array[21]}"
+        
+        return {
+            "Device code": DEC,
+            "Device name": DEV,
+            "Code flash ROM": CEN,
+            "Data flash ROM": DEN,
+            "Firmware version": VER
+        }
+    
+    def dump(s, file):
+        ocd_id = [0]*0xa
+        byte_count = 0
+        data_buffer = bytearray()
+
+        s.port.timeout = 1
+        sig = s.a.silicon_sig()
+        size = int.from_bytes(sig[13:16], "little")
+        s.print_dict(s.parse_signature(sig))
+
+        if not s.reset(RL78.MODE_OCD):
+            print('failed to init OCD')
+            exit()
+        if not s.ocd.unlock(ocd_id):
+            print('failed to unlock')
+            exit()
+        print("Writing to OCD and excuting code")
+        print(f"Dumping: 0x{size:0{5}X} Bytes")
+        s.ocd.write(0x07E0, s.SHELLCODE)
+        s.ocd.call_f07e0()
+        with open(file, "wb") as bin_file:
+            while byte_count < (size + 1):
+                data = s.port.read(1)
+                data_buffer.append(data[0])
+                # terminal goes brrrrr
+                if data:
+                    print(f"{data.hex().upper()} ", end='')
+                    byte_count += 1
+                    if byte_count % 16 == 0:
+                        print()
+            bin_file.write(data_buffer)
+            bin_file.flush()
+        print("\nDone!")
+
+
 
 if __name__ == '__main__':
-    rl78 = RL78('ftdi://ftdi:232h/0', 'COM5')
+    parser = argparse.ArgumentParser(description="Specify the COM port for RL78 and an optional dump file.")
+    parser.add_argument(
+        '--port', 
+        type=str, 
+        required=True, 
+        help='The COM port to use (e.g., COM5).'
+    )
+    parser.add_argument(
+        '--dump', 
+        type=str, 
+        required=False, 
+        help='Path to the dump file.'
+    )
+    
+    args = parser.parse_args()
+    rl78 = RL78(args.port)
     if not rl78.reset(RL78.MODE_A_1WIRE):
         print('failed to init a')
         exit()
     print('sig', binascii.hexlify(rl78.a.silicon_sig()))
     print('sec', binascii.hexlify(rl78.a.security_get()))
+
+    if args.dump:
+        rl78.dump(args.dump)
+        exit()
     code.InteractiveConsole(locals = locals()).interact('Entering shell...')
